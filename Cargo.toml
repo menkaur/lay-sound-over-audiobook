@@ -1,7 +1,6 @@
-
 [package]
 name = "drop-ins"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -13,3 +12,5 @@ rand = ">=0.8, <0.9"
 rayon = "1"
 natord = "1.0"
 tempfile = "3"
+indicatif = "0.17"
+ctrlc = "3"
