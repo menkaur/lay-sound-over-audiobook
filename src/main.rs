@@ -28,9 +28,63 @@ const IMAGE_EXTENSIONS: &[&str] = &[
 ];
 
 // ─── CLI Arguments ─────────────────────────────────────────────
-
 #[derive(Parser, Debug)]
-#[command(name = "drop-ins", version, about)]
+#[command(
+    name = "overlay-music",
+    version,
+    about = "🎧 Overlay background music onto audiobook/podcast files with loudness normalization",
+    long_about = "\
+🎧 overlay-music — Overlay background music onto audiobook/podcast files
+
+Processes a directory of audio files by:
+  1. Normalizing voice audio (EBU R128 two-pass loudnorm)
+  2. Shuffling and seamlessly overlaying background music
+  3. Encoding to the chosen output format
+
+Music plays continuously across files, picking up exactly where it
+left off. Voice and music are mixed so the voice stays prominent
+while music provides ambiance.",
+    after_long_help = "\
+EXAMPLES:
+  Basic usage (defaults: ogg format, quality 6, 44100 Hz):
+    overlay-music --input ./audiobook --music ./ambient
+
+  MP3 output at high quality with 1.5x voice speed:
+    overlay-music -i ./audiobook -m ./music -f mp3 -q 2 --speed 1.5
+
+  FLAC lossless with music normalization and crossfades:
+    overlay-music -i ./audiobook -m ./music -f flac -q 8 \\
+      --normalize-music --crossfade 3.0
+
+  Split m4b audiobook into chapters with music fades:
+    overlay-music -i ./books -m ./ambient --split-chapters \\
+      --music-fade-in 2.0 --music-fade-out 2.0
+
+  Custom loudness targets with quiet music:
+    overlay-music -i ./podcast -m ./bgm -l 5.0 \\
+      --loudness-i -14.0 --loudness-tp -1.0 --loudness-lra 7.0
+
+  Resume interrupted processing with JSON log:
+    overlay-music -i ./audiobook -m ./music --resume --log run.json
+
+  Preview what would happen without processing:
+    overlay-music -i ./audiobook -m ./music --dry-run
+
+  Opus output at 160kbps with 8 threads and 2s pause between tracks:
+    overlay-music -i ./episodes -m ./music -f opus -q 6 -t 8 --pause 2.0
+
+  Speed up voice 2x, lower music more, custom sample rate:
+    overlay-music -i ./lectures -m ./ambient --speed 2.0 -l 4.0 \\
+      --sample-rate 48000
+
+NOTES:
+  • Voice speed (--speed) only affects voice; music plays at normal tempo
+  • --crossfade supersedes --pause when both are specified
+  • Cover images are extracted from source files and placed as cover.jpg
+  • All image files (jpg/png/etc) from the input tree are copied to output
+  • The duration cache (.audio_duration_cache.json) speeds up re-runs
+  • Chapter splitting works best with m4b/m4a files containing chapter metadata"
+)]
 struct Args {
     /// Input directory containing audio files (searched recursively, natural sort)
     #[arg(short, long)]
@@ -40,83 +94,82 @@ struct Args {
     #[arg(short, long)]
     music: PathBuf,
 
-    /// Output directory. Defaults to <input>_processed/
+    /// Output directory [default: <input>_processed/]
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Loudness drop for music (music volume = 1 / this_value)
-    #[arg(short = 'l', long = "loudness-drop", default_value_t = 4.0)]
+    /// Loudness drop for music (music volume = 1 / this_value) [higher = quieter music]
+    #[arg(short = 'l', long = "loudness-drop", default_value_t = 3.0)]
     loudness_drop: f64,
 
-    /// Number of processing threads
+    /// Number of parallel processing threads
     #[arg(short = 't', long, default_value_t = 48)]
     threads: usize,
 
-    /// Pause between music tracks (seconds). Ignored if --crossfade > 0.
+    /// Silence between music tracks in seconds (ignored if --crossfade > 0)
     #[arg(short, long, default_value_t = 0.0)]
     pause: f64,
 
-    /// Crossfade duration between music tracks (seconds). Supersedes --pause.
+    /// Crossfade between music tracks in seconds (supersedes --pause)
     #[arg(long, default_value_t = 0.0)]
     crossfade: f64,
 
-    /// Output format
+    /// Output audio format
     #[arg(short, long, value_enum, default_value_t = OutputFormat::Ogg)]
     format: OutputFormat,
 
-    /// Output quality (0–10 for ogg/mp3/opus, 0–12 for flac)
+    /// Output quality (0–10 for ogg/mp3/opus, 0–12 for flac) [lower = better for mp3]
     #[arg(short, long, default_value_t = 6)]
     quality: u8,
 
-    /// Sample rate in Hz
+    /// Output sample rate in Hz
     #[arg(long, default_value_t = 44100)]
     sample_rate: u32,
 
-    /// Target integrated loudness (LUFS)
+    /// Target integrated loudness in LUFS (EBU R128)
     #[arg(long, default_value_t = -16.0)]
     loudness_i: f64,
 
-    /// True peak limit (dBTP)
+    /// True peak limit in dBTP
     #[arg(long, default_value_t = -1.5)]
     loudness_tp: f64,
 
-    /// Loudness range (LU)
+    /// Loudness range target in LU
     #[arg(long, default_value_t = 11.0)]
     loudness_lra: f64,
 
-    /// Music fade-in at start of each input file (seconds)
+    /// Fade in music at the start of each output file (seconds)
     #[arg(long, default_value_t = 0.0)]
     music_fade_in: f64,
 
-    /// Music fade-out at end of each input file (seconds)
+    /// Fade out music at the end of each output file (seconds)
     #[arg(long, default_value_t = 0.0)]
     music_fade_out: f64,
 
-    /// Also normalize music tracks
+    /// Also normalize music tracks to the same loudness target
     #[arg(long, default_value_t = false)]
     normalize_music: bool,
 
-    /// Skip files that already exist in output directory
+    /// Skip files whose output already exists (resume interrupted runs)
     #[arg(long, default_value_t = false)]
     resume: bool,
 
-    /// Show what would be done without doing it
+    /// Show what would be done without writing any files
     #[arg(long, default_value_t = false)]
     dry_run: bool,
 
-    /// Split m4b/m4a audiobooks by chapters
+    /// Split m4b/m4a audiobooks by embedded chapter metadata
     #[arg(long, default_value_t = false)]
     split_chapters: bool,
 
-    /// Write JSON log to file
+    /// Write a machine-readable JSON log to this file
     #[arg(long)]
     log: Option<PathBuf>,
 
-    /// Speed up voice audio (1.0 = normal, 1.5 = 50% faster). Music is unaffected.
+    /// Speed up voice audio (0.5–100.0, default 1.0). Music tempo is unaffected.
     #[arg(long, default_value_t = 1.0)]
     speed: f64,
 }
-
 // ─── Input Item ────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
