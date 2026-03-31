@@ -14,6 +14,7 @@ use clap::Parser;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -21,6 +22,13 @@ use std::sync::{Arc, Mutex};
 
 const CACHE_FILE: &str = ".audio_duration_cache.json";
 const MIN_DURATION: f64 = 0.01;
+
+/// Absolute tolerance (seconds) when comparing a cached normalized file's
+/// duration to the original source duration.
+const NORM_DURATION_TOLERANCE_S: f64 = 2.0;
+
+/// Relative tolerance (fraction) used as an alternative to the absolute check.
+const NORM_DURATION_TOLERANCE_PCT: f64 = 0.05;
 
 /// Image extensions to copy from source directories.
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -77,13 +85,26 @@ EXAMPLES:
     overlay-music -i ./lectures -m ./ambient --speed 2.0 -l 4.0 \\
       --sample-rate 48000
 
+  Skip input normalization (overlay on original files):
+    overlay-music -i ./audiobook -m ./music --normalize-input=false
+
+  Normalize music to a custom directory:
+    overlay-music -i ./audiobook -m ./music --normalize-music \\
+      --normalize-music-output ./normalized_bgm
+
+  Re-normalize music even if cached versions exist:
+    overlay-music -i ./audiobook -m ./music --normalize-music \\
+      --force-normalize-music
+
 NOTES:
   • Voice speed (--speed) only affects voice; music plays at normal tempo
   • --crossfade supersedes --pause when both are specified
   • Cover images are extracted from source files and placed as cover.jpg
   • All image files (jpg/png/etc) from the input tree are copied to output
   • The duration cache (.audio_duration_cache.json) speeds up re-runs
-  • Chapter splitting works best with m4b/m4a files containing chapter metadata"
+  • Chapter splitting works best with m4b/m4a files containing chapter metadata
+  • Normalized music files are cached by default; use --force-normalize-music
+    to re-normalize (e.g. after changing loudness targets)"
 )]
 struct Args {
     /// Input directory containing audio files (searched recursively, natural sort)
@@ -146,9 +167,25 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     music_fade_out: f64,
 
+    /// Normalize input audio files (two-pass loudnorm).
+    /// Set to false to overlay music on original (non-normalized) files.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    normalize_input: bool,
+
     /// Also normalize music tracks to the same loudness target
     #[arg(long, default_value_t = false)]
     normalize_music: bool,
+
+    /// Output directory for normalized music files (only used with --normalize-music).
+    /// [default: <music>_normalized/]
+    #[arg(long)]
+    normalize_music_output: Option<PathBuf>,
+
+    /// Force re-normalization of all music files, even if normalized versions
+    /// already exist in the output directory and pass duration checks.
+    /// Useful after changing loudness targets or sample rate.
+    #[arg(long, default_value_t = false)]
+    force_normalize_music: bool,
 
     /// Skip files whose output already exists (resume interrupted runs)
     #[arg(long, default_value_t = false)]
@@ -170,6 +207,7 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     speed: f64,
 }
+
 // ─── Input Item ────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -247,6 +285,12 @@ fn validate_args(cli: &Args) {
     if !cli.music.is_dir() {
         eprintln!("❌ Music directory does not exist: {:?}", cli.music);
         std::process::exit(1);
+    }
+    if cli.normalize_music_output.is_some() && !cli.normalize_music {
+        eprintln!("ℹ️  --normalize-music-output requires --normalize-music; ignoring");
+    }
+    if cli.force_normalize_music && !cli.normalize_music {
+        eprintln!("ℹ️  --force-normalize-music requires --normalize-music; ignoring");
     }
     for tool in ["ffmpeg", "ffprobe"] {
         if Command::new(tool)
@@ -349,7 +393,7 @@ fn is_image(path: &Path) -> bool {
 }
 
 /// Copy all image files from the input directory tree to the output
-/// directory tree, preserving relative paths. Also extracts embedded
+/// directory tree, preserving relative paths.  Also extracts embedded
 /// cover art from audio files and places `cover.jpg` in each output
 /// subdirectory.
 ///
@@ -379,7 +423,6 @@ fn copy_images_and_extract_covers(
         let rel = src.strip_prefix(input_dir).unwrap_or(src);
         let dst = output_dir.join(rel);
 
-        // Skip if already exists
         if dst.exists() {
             copied += 1;
             continue;
@@ -415,6 +458,40 @@ fn copy_images_and_extract_covers(
         "    {} image(s) copied, {} cover(s) extracted\n",
         copied, extracted
     );
+}
+
+/// Derive the default normalized-music output directory from the music path.
+///
+/// `./music` → `./music_normalized`
+/// `./path/to/bgm` → `./path/to/bgm_normalized`
+fn default_normalize_music_dir(music: &Path) -> PathBuf {
+    let mut name = music
+        .file_name()
+        .unwrap_or(music.as_os_str())
+        .to_os_string();
+    name.push("_normalized");
+    match music.parent() {
+        Some(parent) if parent != Path::new("") => parent.join(name),
+        _ => PathBuf::from(name),
+    }
+}
+
+/// Deterministic path for the normalized version of a music source file.
+///
+/// Preserves the relative directory structure from `music_dir` inside
+/// `norm_dir`, replacing the extension with `.wav`.
+///
+/// ```text
+/// music_dir  = ./music
+/// source     = ./music/ambient/track1.mp3
+/// norm_dir   = ./music_normalized
+/// result     = ./music_normalized/ambient/track1.wav
+/// ```
+fn normalized_music_path(norm_dir: &Path, music_dir: &Path, source: &Path) -> PathBuf {
+    let rel = source
+        .strip_prefix(music_dir)
+        .unwrap_or_else(|_| source.as_ref());
+    norm_dir.join(rel).with_extension("wav")
 }
 
 // ─── Main ──────────────────────────────────────────────────────
@@ -456,7 +533,12 @@ fn main() {
             loudness_lra: cli.loudness_lra,
             music_fade_in: cli.music_fade_in,
             music_fade_out: cli.music_fade_out,
+            normalize_input: cli.normalize_input,
             normalize_music: cli.normalize_music,
+            normalize_music_output: cli
+                .normalize_music_output
+                .as_ref()
+                .map(|p| p.to_string_lossy().into()),
             split_chapters: cli.split_chapters,
             speed: cli.speed,
         },
@@ -476,6 +558,9 @@ fn main() {
     );
     if (cli.speed - 1.0).abs() > 0.001 {
         println!("⏩  Voice speed: {:.2}x", cli.speed);
+    }
+    if !cli.normalize_input {
+        println!("⏭️   Input normalization: disabled (overlaying on original files)");
     }
     println!();
 
@@ -533,71 +618,194 @@ fn main() {
     }
 
     // ── 1b. Optionally normalize music ─────────────────────────
+    //
+    // When --normalize-music is set we:
+    //   1. Resolve the output directory (custom or default).
+    //   2. Check for previously-normalized files that still pass a
+    //      duration sanity check (skipped with --force-normalize-music).
+    //   3. Normalize only the files that are missing or invalid.
+    //   4. If the directory cannot be created, offer a temp-dir fallback.
+    //
+    // The temp dir handle must survive until the end of main(), so we
+    // keep it in `_music_tmp_dir`.
     let _music_tmp_dir: Option<tempfile::TempDir>;
 
-    if cli.normalize_music && !cli.dry_run {
-        println!("🔊  Normalizing music tracks...");
-        let tmp_music = tempfile::tempdir().expect("failed to create temp dir for music");
-        let pb = progress::create_bar(&mp, music_files.len() as u64, "Normalizing music");
+    if cli.normalize_music {
+        if cli.dry_run {
+            println!(
+                "🔊  [DRY RUN] Would normalize {} music tracks\n",
+                music_files.len()
+            );
+            _music_tmp_dir = None;
+        } else {
+            println!("🔊  Normalizing music tracks (two-pass loudnorm)...");
 
-        let results: Vec<Option<(PathBuf, f64)>> = music_files
-            .par_iter()
-            .enumerate()
-            .map(|(i, src)| {
-                if cancelled.load(Ordering::Relaxed) {
-                    return None;
+            // ── Resolve output directory ───────────────────────
+            let norm_music_dir: PathBuf = cli
+                .normalize_music_output
+                .clone()
+                .unwrap_or_else(|| default_normalize_music_dir(&cli.music));
+
+            let (actual_norm_dir, temp_holder): (PathBuf, Option<tempfile::TempDir>) =
+                match fs::create_dir_all(&norm_music_dir) {
+                    Ok(_) => {
+                        println!("    Output directory: {:?}", norm_music_dir);
+                        (norm_music_dir, None)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "⚠️  Cannot create normalized music directory {:?}: {}",
+                            norm_music_dir, e
+                        );
+                        let tmp = tempfile::tempdir().expect("failed to create temp dir for music");
+                        let tmp_path = tmp.path().to_path_buf();
+                        eprintln!("    Using temporary directory instead: {:?}", tmp_path);
+                        eprintln!(
+                            "    ⚠️  Normalized music files will be deleted when processing completes."
+                        );
+                        eprint!("    Continue? [Y/n] ");
+                        io::stdout().flush().unwrap();
+                        let mut answer = String::new();
+                        io::stdin().read_line(&mut answer).unwrap();
+                        let answer = answer.trim().to_lowercase();
+                        if answer == "n" || answer == "no" {
+                            eprintln!("Aborted.");
+                            cleanup_and_exit(&cli, &json_log, 1);
+                        }
+                        (tmp_path, Some(tmp))
+                    }
+                };
+
+            let is_temp = temp_holder.is_some();
+
+            // ── Check for already-normalized files ─────────────
+            let mut already_done: Vec<(PathBuf, f64)> = Vec::new();
+            let mut to_normalize: Vec<(PathBuf, PathBuf)> = Vec::new(); // (source, dest)
+
+            let can_use_cache = !cli.force_normalize_music && !is_temp;
+
+            if can_use_cache {
+                for (i, src) in music_files.iter().enumerate() {
+                    let norm_path = normalized_music_path(&actual_norm_dir, &cli.music, src);
+                    let src_dur = music_durs[i];
+
+                    let cached_dur = if norm_path.exists() {
+                        cache::get_duration(&norm_path, &dur_cache)
+                    } else {
+                        None
+                    };
+
+                    let is_valid = cached_dur.map_or(false, |d| {
+                        if d <= MIN_DURATION {
+                            return false;
+                        }
+                        let diff = (d - src_dur).abs();
+                        diff <= NORM_DURATION_TOLERANCE_S
+                            || diff <= src_dur * NORM_DURATION_TOLERANCE_PCT
+                    });
+
+                    if is_valid {
+                        already_done.push((norm_path, cached_dur.unwrap()));
+                    } else {
+                        to_normalize.push((src.clone(), norm_path));
+                    }
                 }
-                let src_dur = cache::get_duration(src, &dur_cache).unwrap_or(0.0);
-                let m = ffmpeg::measure_loudness(
-                    src,
-                    cli.loudness_i,
-                    cli.loudness_tp,
-                    cli.loudness_lra,
-                    src_dur,
-                    None,
-                )?;
-                let dst = discovery::append_extension(
-                    tmp_music.path(),
-                    &PathBuf::from(format!("music_{i}")),
-                    "wav",
+
+                if !already_done.is_empty() {
+                    println!(
+                        "    ⏭️  {} music track(s) already normalized \
+                         (use --force-normalize-music to redo)",
+                        already_done.len()
+                    );
+                }
+            } else {
+                if cli.force_normalize_music {
+                    println!("    🔄 Forcing re-normalization of all music tracks");
+                }
+                for src in music_files.iter() {
+                    let norm_path = normalized_music_path(&actual_norm_dir, &cli.music, src);
+                    to_normalize.push((src.clone(), norm_path));
+                }
+            }
+
+            // ── Normalize the remaining files ──────────────────
+            if !to_normalize.is_empty() {
+                let pb = progress::create_bar(&mp, to_normalize.len() as u64, "Normalizing music");
+
+                let results: Vec<Option<(PathBuf, f64)>> = to_normalize
+                    .par_iter()
+                    .map(|(src, dst)| {
+                        if cancelled.load(Ordering::Relaxed) {
+                            return None;
+                        }
+                        let src_dur = cache::get_duration(src, &dur_cache).unwrap_or(0.0);
+                        let m = ffmpeg::measure_loudness(
+                            src,
+                            cli.loudness_i,
+                            cli.loudness_tp,
+                            cli.loudness_lra,
+                            src_dur,
+                            None,
+                        )?;
+                        if let Some(p) = dst.parent() {
+                            let _ = fs::create_dir_all(p);
+                        }
+                        let (ok, _) = ffmpeg::normalize_two_pass(
+                            src,
+                            dst,
+                            cli.loudness_i,
+                            cli.loudness_tp,
+                            cli.loudness_lra,
+                            cli.sample_rate,
+                            &m,
+                            src_dur,
+                            None,
+                        );
+                        pb.inc(1);
+                        if !ok {
+                            return None;
+                        }
+                        let dur = cache::get_duration(dst, &dur_cache)?;
+                        if dur > MIN_DURATION {
+                            Some((dst.clone(), dur))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                pb.finish_with_message("Done");
+
+                let newly_normalized: Vec<(PathBuf, f64)> = results.into_iter().flatten().collect();
+                println!(
+                    "    {} music track(s) newly normalized",
+                    newly_normalized.len()
                 );
-                let (ok, _) = ffmpeg::normalize_two_pass(
-                    src,
-                    &dst,
-                    cli.loudness_i,
-                    cli.loudness_tp,
-                    cli.loudness_lra,
-                    cli.sample_rate,
-                    &m,
-                    src_dur,
-                    None,
+                already_done.extend(newly_normalized);
+            }
+
+            // ── Replace music_files / music_durs ───────────────
+            let total_norm = already_done.len();
+            let (nf, nd): (Vec<_>, Vec<_>) = already_done.into_iter().unzip();
+
+            if !is_temp {
+                println!(
+                    "    {} total normalized music track(s) in: {:?}\n",
+                    total_norm, actual_norm_dir
                 );
-                pb.inc(1);
-                if !ok {
-                    return None;
-                }
-                let dur = cache::get_duration(&dst, &dur_cache)?;
-                if dur > MIN_DURATION {
-                    Some((dst, dur))
-                } else {
-                    None
-                }
-            })
-            .collect();
+            } else {
+                println!("    {} total normalized music track(s)\n", total_norm);
+            }
 
-        pb.finish_with_message("Done");
+            if nf.is_empty() {
+                eprintln!("❌ All music normalization failed.");
+                cleanup_and_exit(&cli, &json_log, 1);
+            }
 
-        let (nf, nd): (Vec<_>, Vec<_>) = results.into_iter().flatten().unzip();
-        println!("    {} music tracks normalized\n", nf.len());
-
-        if nf.is_empty() {
-            eprintln!("❌ All music normalization failed.");
-            cleanup_and_exit(&cli, &json_log, 1);
+            music_files = nf;
+            music_durs = nd;
+            _music_tmp_dir = temp_holder;
         }
-
-        music_files = nf;
-        music_durs = nd;
-        _music_tmp_dir = Some(tmp_music);
     } else {
         _music_tmp_dir = None;
     }
@@ -629,19 +837,35 @@ fn main() {
     println!("    {} files to process\n", input_items.len());
     check_cancel(&cancelled, &cli, &json_log);
 
-    // ── 3. Normalise (two-pass loudnorm) to temp dir ───────────
+    // ── 3. Optionally normalise (two-pass loudnorm) to temp dir ────
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
 
-    if cli.dry_run {
-        println!("🔊  [DRY RUN] Would normalize {} files", input_items.len());
+    if cli.normalize_input {
+        if cli.dry_run {
+            println!("🔊  [DRY RUN] Would normalize {} files", input_items.len());
+        } else {
+            println!(
+                "🔊  Normalizing {} files (two-pass loudnorm)",
+                input_items.len()
+            );
+        }
     } else {
+        println!("⏭️   Skipping input normalization (--normalize-input=false)");
         println!(
-            "🔊  Normalizing {} files (two-pass loudnorm)",
+            "    Overlaying music on original {} files",
             input_items.len()
         );
     }
 
-    let pb_norm = progress::create_bar(&mp, input_items.len() as u64, "Normalizing");
+    let pb_norm = progress::create_bar(
+        &mp,
+        input_items.len() as u64,
+        if cli.normalize_input {
+            "Normalizing"
+        } else {
+            "Preparing"
+        },
+    );
     let failed_norm = AtomicUsize::new(0);
 
     let normed: Vec<Option<(InputItem, PathBuf, f64)>> = input_items
@@ -653,6 +877,7 @@ fn main() {
 
             let dst = discovery::append_extension(tmp.path(), &item.relative, "wav");
 
+            // ── Dry-run shortcut ───────────────────────────────
             if cli.dry_run {
                 pb_norm.inc(1);
                 let raw_dur = item
@@ -662,10 +887,18 @@ fn main() {
                     .or_else(|| cache::get_duration(&item.source, &dur_cache))
                     .unwrap_or(60.0);
                 let adjusted = raw_dur / cli.speed;
-                return Some((item.clone(), dst, adjusted));
+                return Some((
+                    item.clone(),
+                    if cli.normalize_input {
+                        dst
+                    } else {
+                        item.source.clone()
+                    },
+                    adjusted,
+                ));
             }
 
-            // For chapters, extract the segment first
+            // ── For chapters, extract the segment first ────────
             let source_for_norm = if let Some(ref ch) = item.chapter {
                 let chapter_tmp = dst.with_extension("chapter.wav");
                 if let Some(p) = chapter_tmp.parent() {
@@ -700,10 +933,30 @@ fn main() {
                 item.source.clone()
             };
 
-            // Get source duration for progress tracking
+            // ── Skip normalization when disabled ───────────────
+            if !cli.normalize_input {
+                pb_norm.inc(1);
+                let raw_dur = cache::get_duration(&source_for_norm, &dur_cache).unwrap_or(0.0);
+                let adjusted = raw_dur / cli.speed;
+                if adjusted > MIN_DURATION {
+                    let use_file = if item.chapter.is_some() {
+                        source_for_norm // keep extracted chapter
+                    } else {
+                        item.source.clone()
+                    };
+                    return Some((item.clone(), use_file, adjusted));
+                } else {
+                    if item.chapter.is_some() {
+                        let _ = fs::remove_file(&source_for_norm);
+                    }
+                    failed_norm.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+
+            // ── Pass 1: measure loudness ───────────────────────
             let src_dur = cache::get_duration(&source_for_norm, &dur_cache).unwrap_or(0.0);
 
-            // Pass 1: measure
             let measurement = match ffmpeg::measure_loudness(
                 &source_for_norm,
                 cli.loudness_i,
@@ -723,7 +976,7 @@ fn main() {
                 }
             };
 
-            // Pass 2: apply
+            // ── Pass 2: normalize ──────────────────────────────
             let (ok, _cmd) = ffmpeg::normalize_two_pass(
                 &source_for_norm,
                 &dst,
@@ -736,7 +989,6 @@ fn main() {
                 None,
             );
 
-            // Clean up chapter temp
             if item.chapter.is_some() {
                 let _ = fs::remove_file(&source_for_norm);
             }
@@ -765,7 +1017,15 @@ fn main() {
 
     let failed = failed_norm.load(Ordering::Relaxed);
     if failed > 0 {
-        eprintln!("    ⚠️  {} files failed normalization", failed);
+        eprintln!(
+            "    ⚠️  {} files failed {}",
+            failed,
+            if cli.normalize_input {
+                "normalization"
+            } else {
+                "preparation"
+            }
+        );
     }
 
     cache::save(&dur_cache.lock().unwrap(), &cache_path);
@@ -784,7 +1044,14 @@ fn main() {
     }
 
     if ready.is_empty() {
-        eprintln!("❌ No files could be normalized.");
+        eprintln!(
+            "❌ No files could be {}.",
+            if cli.normalize_input {
+                "normalized"
+            } else {
+                "prepared"
+            }
+        );
         cleanup_and_exit(&cli, &json_log, 1);
     }
 

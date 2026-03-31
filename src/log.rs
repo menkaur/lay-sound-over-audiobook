@@ -34,7 +34,9 @@ pub struct LogSettings {
     pub loudness_lra: f64,
     pub music_fade_in: f64,
     pub music_fade_out: f64,
+    pub normalize_input: bool,
     pub normalize_music: bool,
+    pub normalize_music_output: Option<String>,
     pub split_chapters: bool,
     pub speed: f64,
 }
