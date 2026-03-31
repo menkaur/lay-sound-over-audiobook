@@ -1,0 +1,15 @@
+
+[package]
+name = "drop-ins"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = ">=0.8, <0.9"
+rayon = "1"
+natord = "1.0"
+tempfile = "3"
