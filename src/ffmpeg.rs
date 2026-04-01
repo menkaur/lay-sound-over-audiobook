@@ -14,7 +14,7 @@ use crate::plan::MusicPiece;
 use clap::ValueEnum;
 use indicatif::ProgressBar;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -137,6 +137,64 @@ fn update_progress(pb: &ProgressBar, time: f64, expected_duration: f64) {
     }
 }
 
+/// Read ffmpeg stderr, splitting on `\r` and `\n` (ffmpeg uses `\r` for
+/// real-time progress updates). Updates progress bar and optionally
+/// captures the full output text.
+fn read_ffmpeg_stderr(
+    stderr: impl Read,
+    expected_duration: f64,
+    pb: Option<&ProgressBar>,
+    capture: bool,
+) -> String {
+    let mut reader = BufReader::new(stderr);
+    let mut chunk = [0u8; 4096];
+    let mut line_buf = Vec::with_capacity(256);
+    let mut output = String::new();
+
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &b in &chunk[..n] {
+                    if b == b'\r' || b == b'\n' {
+                        if !line_buf.is_empty() {
+                            let line = String::from_utf8_lossy(&line_buf);
+                            if let Some(time) = extract_progress_time(&line) {
+                                if let Some(pb) = pb {
+                                    update_progress(pb, time, expected_duration);
+                                }
+                            }
+                            if capture {
+                                output.push_str(&line);
+                                output.push('\n');
+                            }
+                            line_buf.clear();
+                        }
+                    } else {
+                        line_buf.push(b);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    // Flush remaining bytes
+    if !line_buf.is_empty() {
+        let line = String::from_utf8_lossy(&line_buf);
+        if let Some(time) = extract_progress_time(&line) {
+            if let Some(pb) = pb {
+                update_progress(pb, time, expected_duration);
+            }
+        }
+        if capture {
+            output.push_str(&line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
 /// Spawn ffmpeg, read stderr for `time=` progress, optionally update
 /// a progress bar. Returns `true` if ffmpeg exited successfully.
 fn run_ffmpeg_tracked(args: &[String], expected_duration: f64, pb: Option<&ProgressBar>) -> bool {
@@ -151,14 +209,7 @@ fn run_ffmpeg_tracked(args: &[String], expected_duration: f64, pb: Option<&Progr
     };
 
     if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(time) = extract_progress_time(&line) {
-                if let Some(pb) = pb {
-                    update_progress(pb, time, expected_duration);
-                }
-            }
-        }
+        read_ffmpeg_stderr(stderr, expected_duration, pb, false);
     }
 
     matches!(child.wait(), Ok(s) if s.success())
@@ -182,20 +233,11 @@ fn run_ffmpeg_tracked_capture(
         Err(_) => return (false, String::new()),
     };
 
-    let mut full_stderr = String::new();
-
-    if let Some(stderr) = child.stderr.take() {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            if let Some(time) = extract_progress_time(&line) {
-                if let Some(pb) = pb {
-                    update_progress(pb, time, expected_duration);
-                }
-            }
-            full_stderr.push_str(&line);
-            full_stderr.push('\n');
-        }
-    }
+    let full_stderr = child
+        .stderr
+        .take()
+        .map(|stderr| read_ffmpeg_stderr(stderr, expected_duration, pb, true))
+        .unwrap_or_default();
 
     let success = matches!(child.wait(), Ok(s) if s.success());
     (success, full_stderr)

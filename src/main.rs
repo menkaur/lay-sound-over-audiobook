@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-const CACHE_FILE: &str = ".audio_duration_cache.json";
+pub const CACHE_FILE: &str = ".audio_duration_cache.json";
 
 /// Minimum usable audio duration in seconds — files/chapters shorter
 /// than this are skipped as unusable.  Shared across modules.
@@ -205,7 +205,7 @@ fn main() {
     cache::save(&dur_cache.lock().unwrap(), &cache_path);
 
     // ── Process music results ─────────────────────────────────────
-    let (mut music_files, mut music_durs): (Vec<_>, Vec<_>) = music_ok
+    let (music_files, music_durs): (Vec<_>, Vec<_>) = music_ok
         .into_iter()
         .filter(|(_, d)| *d > MIN_DURATION)
         .unzip();
@@ -249,73 +249,35 @@ fn main() {
 
     check_cancel(&cancelled, &cli, &json_log);
 
-    // ══════════════════════════════════════════════════════════════
-    // Phase 2: Normalize music (if requested)
-    // ══════════════════════════════════════════════════════════════
-
-    let _music_tmp_dir: Option<tempfile::TempDir>;
-
-    match music_norm::normalize_music(
-        &cli,
-        &music_files,
-        &music_durs,
-        &dur_cache,
-        &cancelled,
-        &mp,
-    ) {
-        Ok(Some(result)) => {
-            music_files = result.files;
-            music_durs = result.durations;
-            _music_tmp_dir = result._tmp_dir;
-        }
-        Ok(None) => {
-            _music_tmp_dir = None;
-        }
-        Err(msg) => {
-            eprintln!("❌ {msg}");
-            cleanup_and_exit(&cli, &json_log, 1);
-        }
+    // ── Spot-check music loudness (if normalization disabled) ────
+    if !cli.normalize_music {
+        let target = ffmpeg::LoudnessTarget {
+            i: cli.loudness_i,
+            tp: cli.loudness_tp,
+            lra: cli.loudness_lra,
+        };
+        music_norm::spot_check_loudness(&target, &music_files);
     }
 
-    cache::save(&dur_cache.lock().unwrap(), &cache_path);
-    check_cancel(&cancelled, &cli, &json_log);
-
     // ══════════════════════════════════════════════════════════════
-    // Phase 3: Build seamless music plan
+    // Phase 2: Assemble file plans (music planning deferred to pipeline)
     // ══════════════════════════════════════════════════════════════
 
-    println!("🎲  Building seamless music overlay plan...");
     let adjusted_durations: Vec<f64> = input_with_durs.iter().map(|(_, d)| d / cli.speed).collect();
-    let plans = plan::build_music_plan(
-        &adjusted_durations,
-        &music_files,
-        &music_durs,
-        cli.pause,
-        cli.crossfade,
-    );
-
     let volume = 1.0 / cli.loudness_drop;
-    println!(
-        "    Music volume = {volume:.4}  (1 / {:.1})\n",
-        cli.loudness_drop
-    );
-
-    // ══════════════════════════════════════════════════════════════
-    // Phase 4: Assemble file plans
-    // ══════════════════════════════════════════════════════════════
 
     let file_plans: Vec<FilePlan> = input_with_durs
         .into_iter()
-        .zip(plans)
-        .map(|((item, raw_dur), pieces)| {
+        .enumerate()
+        .map(|(idx, (item, raw_dur))| {
             let output = output_dir
                 .join(&item.relative)
                 .with_extension(cli.format.extension());
             FilePlan {
                 item,
-                pieces,
                 source_duration: raw_dur,
                 output,
+                plan_index: idx,
             }
         })
         .collect();
@@ -355,16 +317,29 @@ fn main() {
     }
 
     // ══════════════════════════════════════════════════════════════
-    // Phase 5: Per-file streaming pipeline
+    // Phase 3: Per-file streaming pipeline (with concurrent music norm)
     // ══════════════════════════════════════════════════════════════
+
+    let shared = pipeline::PipelineShared {
+        dur_cache: &dur_cache,
+        cancelled: &cancelled,
+        json_log: &json_log,
+        mp: &mp,
+        cache_path: &cache_path,
+    };
 
     pipeline::run_pipeline(
         &cli,
         &file_plans,
-        &dur_cache,
-        &cancelled,
-        &json_log,
-        &mp,
+        pipeline::MusicInput {
+            files: music_files,
+            durations: music_durs,
+            adjusted_input_durations: adjusted_durations,
+            pause: cli.pause,
+            crossfade: cli.crossfade,
+            volume,
+        },
+        &shared,
         {
             // When fewer files than threads, give each ffmpeg more cores
             let ffmpeg_threads =

@@ -19,7 +19,11 @@ Built in Rust for speed. Processes files in parallel with full FFmpeg filter gra
 - **Music fade-in/out** — optional fades at the start and end of each output file
 - **Cover image handling** — extracts embedded cover art, copies existing images from source directories
 - **Resume support** — skip already-processed files to resume interrupted runs
-- **Parallel processing** — configurable thread count for fast batch processing
+- **Music normalization caching** — normalized music files are cached to a separate directory and reused across runs; use `--force-normalize-music` to redo after changing targets
+- **Real-time ffmpeg progress** — normalization and encoding progress bars update in real-time from ffmpeg's `time=` output
+- **Music loudness spot-check** — automatically checks if music files differ from the target loudness and suggests `--normalize-music` if needed
+- **Concurrent normalization** — music normalization and book normalization run in parallel; per-file overlay starts as soon as that file's book norm is done and all music is ready
+- **Adaptive multithreading** — with few large files, spare threads are given to each ffmpeg subprocess for faster encoding/decoding
 - **Duration caching** — `.audio_duration_cache.json` speeds up repeated runs
 - **Dry-run mode** — preview what would happen without writing any files
 - **JSON logging** — machine-readable log for automation pipelines
@@ -71,7 +75,7 @@ This will:
 1. Scan `./audiobook` for audio files (recursively, natural sort order)
 2. Scan `./ambient` for background music files
 3. Normalize all voice files (two-pass loudnorm)
-4. Shuffle music and overlay it at 1/4 volume
+4. Shuffle music and overlay it at 1/3 volume
 5. Encode to OGG and write to `./audiobook_processed/`
 
 ---
@@ -130,6 +134,26 @@ overlay-music -i ./lectures -m ./ambient --speed 2.0 -l 5.0 \
   --sample-rate 48000
 ```
 
+### Skip input normalization (overlay on original files)
+
+```bash
+overlay-music -i ./audiobook -m ./music --normalize-input=false
+```
+
+### Normalize music to a custom directory
+
+```bash
+overlay-music -i ./audiobook -m ./music --normalize-music \
+  --normalize-music-output ./normalized_bgm
+```
+
+### Re-normalize music after changing loudness targets
+
+```bash
+overlay-music -i ./audiobook -m ./music --normalize-music \
+  --force-normalize-music
+```
+
 ### Custom output directory
 
 ```bash
@@ -145,8 +169,8 @@ overlay-music -i ./raw -m ./music -o ./finished
 | `-i` | `--input` | *required* | Input directory containing audio files |
 | `-m` | `--music` | *required* | Music directory containing background music |
 | `-o` | `--output` | `<input>_processed/` | Output directory |
-| `-l` | `--loudness-drop` | `4.0` | Music volume divisor (music vol = 1/this). Higher = quieter music |
-| `-t` | `--threads` | `48` | Number of parallel processing threads |
+| `-l` | `--loudness-drop` | `3.0` | Music volume divisor (music vol = 1/this). Higher = quieter music |
+| `-t` | `--threads` | `48` | Parallel threads. With few large files, spare threads are given to each ffmpeg subprocess |
 | `-p` | `--pause` | `0.0` | Silence between music tracks (seconds) |
 | | `--crossfade` | `0.0` | Crossfade between music tracks (seconds). Supersedes `--pause` |
 | `-f` | `--format` | `ogg` | Output format: `ogg`, `mp3`, `opus`, `flac` |
@@ -157,10 +181,13 @@ overlay-music -i ./raw -m ./music -o ./finished
 | | `--loudness-lra` | `11.0` | Loudness range target (LU) |
 | | `--music-fade-in` | `0.0` | Fade in music at start of each file (seconds) |
 | | `--music-fade-out` | `0.0` | Fade out music at end of each file (seconds) |
-| | `--normalize-music` | `false` | Also normalize music tracks |
+| | `--normalize-input` | `true` | Normalize input audio (set `false` to overlay on originals) |
+| | `--normalize-music` | `false` | Also normalize music tracks to the same loudness target |
+| | `--normalize-music-output` | `<music>_normalized/` | Output directory for normalized music files |
+| | `--force-normalize-music` | `false` | Re-normalize all music even if cached versions exist |
 | | `--resume` | `false` | Skip files whose output already exists |
 | | `--dry-run` | `false` | Preview without writing files |
-| | `--split-chapters` | `false` | Split m4b/m4a by embedded chapter metadata |
+| | `--split-chapters` | `true` | Split m4b/m4a by embedded chapter metadata |
 | | `--log` | *none* | Write JSON log to this file |
 | | `--speed` | `1.0` | Voice speed multiplier (0.5–100.0). Music is unaffected |
 
@@ -194,43 +221,35 @@ Input Files          Background Music
  │ + Cache│          │  + Shuffle │
  └───┬────┘          └─────┬──────┘
      │                      │
-     ▼                      │
- ┌────────────┐             │
- │ Split by   │             │
- │ Chapters   │             │
- │ (optional) │             │
- └───┬────────┘             │
-     │                      │
-     ▼                      │
- ┌────────────┐             │
- │ Two-Pass   │             │
- │ Loudnorm   │             │
- │ (EBU R128) │             │
- └───┬────────┘             │
+     │                      ▼
+     │               ┌────────────┐
+     │               │ Spot-check │
+     │               │ loudness   │
+     │               └─────┬──────┘
      │                      │
      ▼                      ▼
- ┌──────────────────────────────┐
- │     Build Music Plan         │
- │  (seamless cursor across     │
- │   files, crossfade/pause)    │
- └──────────┬───────────────────┘
-            │
-            ▼
- ┌──────────────────────────────┐
- │   FFmpeg Filter Graph        │
- │                              │
- │  Voice: afmt → [atempo] ──┐ │
- │                            │ │
- │  Music: segments → concat  │ │
- │    → fade → volume ──────┐│ │
- │                          ││ │
- │              amix ◄──────┘│ │
- │                ◄──────────┘ │
- │                │            │
- │           alimiter          │
- │                │            │
- │             encode          │
- └──────────┬───────────────────┘
+ ┌─────────────────────────────────────┐
+ │        CONCURRENT PIPELINE          │
+ │                                     │
+ │  ┌───────────────┐  ┌───────────┐  │
+ │  │ Music norm    │  │ Per-file: │  │
+ │  │ (dedicated    │  │  extract  │  │
+ │  │  thread)      │  │  chapter  │  │
+ │  │       │       │  │  → norm   │  │
+ │  │       ▼       │  │  → wait   │  │
+ │  │ Build music ──┼──│→ overlay  │  │
+ │  │ plan  (ready  │  │  → encode │  │
+ │  │  signal)      │  │ (rayon)   │  │
+ │  └───────────────┘  └───────────┘  │
+ │                                     │
+ │  FFmpeg filter graph per file:      │
+ │    Voice → [atempo] ──┐            │
+ │    Music → concat →   │            │
+ │      fade → volume ─┐ │            │
+ │           amix ◄─────┘ │            │
+ │             ◄──────────┘            │
+ │        alimiter → encode            │
+ └──────────┬──────────────────────────┘
             │
             ▼
       Output Files
@@ -240,6 +259,8 @@ Input Files          Background Music
 
 ### Key Design Decisions
 
+- **Concurrent normalization** — music normalization runs in a dedicated OS thread while book normalization runs in the rayon pool; per-file overlay starts as soon as that file's book norm is done and all music is ready
+- **Adaptive ffmpeg threading** — when there are fewer files than threads, spare threads are given to each ffmpeg subprocess (`threads / min(threads, files)`). E.g., 48 threads with 3 files → 16 threads per ffmpeg; 48 threads with 200 files → 1 thread per ffmpeg
 - **Two-pass loudnorm with `linear=true`** — avoids the pumping artifacts of single-pass normalization
 - **`amix=duration=first:normalize=0`** — voice determines output length; no automatic volume halving
 - **`alimiter=limit=1`** — prevents clipping when voice and music peaks coincide
@@ -324,10 +345,23 @@ Use `--log run.json` to produce a machine-readable log:
   "music_dir": "./music",
   "output_dir": "./audiobook_processed",
   "settings": {
-    "loudness_drop": 4.0,
+    "loudness_drop": 3.0,
     "threads": 48,
+    "pause": 0.0,
+    "crossfade": 0.0,
     "format": "ogg",
-    "speed": 1.5
+    "quality": 6,
+    "sample_rate": 44100,
+    "loudness_i": -16.0,
+    "loudness_tp": -1.5,
+    "loudness_lra": 11.0,
+    "music_fade_in": 0.0,
+    "music_fade_out": 0.0,
+    "normalize_input": true,
+    "normalize_music": false,
+    "normalize_music_output": null,
+    "split_chapters": true,
+    "speed": 1.0
   },
   "music_files": 12,
   "music_duration_s": 3600.0,
@@ -362,15 +396,19 @@ The duration cache (`.audio_duration_cache.json`) is saved after each stage, so 
 overlay-music/
 ├── Cargo.toml
 └── src/
-    ├── main.rs          # CLI, orchestration, image copying
+    ├── main.rs          # Thin orchestrator — phase sequencing, Ctrl+C, log init
     ├── cache.rs         # Duration cache (JSON persistence)
     ├── chapters.rs      # Chapter detection via ffprobe
+    ├── cli.rs           # CLI argument parsing, validation, chapter expansion, resume
     ├── cover.rs         # Cover image extraction
     ├── discovery.rs     # File discovery and path helpers
-    ├── ffmpeg.rs        # FFmpeg workers (normalize, overlay, progress)
+    ├── ffmpeg.rs        # FFmpeg workers (normalize, overlay, filter graphs)
+    ├── images.rs        # Image copying and cover extraction orchestration
     ├── log.rs           # JSON log structures
+    ├── music_norm.rs    # Music normalization with caching
+    ├── pipeline.rs      # Per-file streaming pipeline (parallel processing)
     ├── plan.rs          # Music overlay planner
-    ├── progress.rs      # Progress bar helpers
+    ├── progress.rs      # Progress bar helpers (per-worker bars)
     └── time.rs          # Lightweight ISO 8601 timestamps
 ```
 
@@ -390,17 +428,3 @@ MIT
 - [indicatif](https://github.com/console-rs/indicatif) — progress bars
 - [walkdir](https://github.com/BurntSushi/walkdir) — recursive directory traversal
 - [natord](https://github.com/lifthrasiir/rust-natord) — natural sort order
-
-
-### References
-
-1. **GitHub - Mrhuma/Mrhumas-Music-Overlay: A program for showing which song is playing in YouTube Music Desktop Player or Spotify. · GitHub**. [https://github.com](https://github.com/Mrhuma/Mrhumas-Music-Overlay)
-2. **GitHub - TomasBisciak/Windows-Loudness-Equalization-toggle: This application creates a TOGGLE KEY, to enable and disable this feature as needed by pressing just one key, since you won’t want to use it while you listen to music and other content where audio levels are preferred to be unbalanced.**. [https://github.com](https://github.com/TomasBisciak/Windows-Loudness-Equalization-toggle)
-3. **GitHub - gentoo-audio/audio-overlay: Gentoo overlay for music production · GitHub**. [https://github.com](https://github.com/gentoo-audio/audio-overlay)
-4. **GitHub - kklobe/normalize: an audio file volume normalizer · GitHub**. [https://github.com](https://github.com/kklobe/normalize)
-5. **8.1 oreo - Music app overlay with control on volume level change - Android Enthusiasts Stack Exchange**. [https://android.stackexchange.com](https://android.stackexchange.com/questions/204075/music-app-overlay-with-control-on-volume-level-change)
-6. **Normalize volume level with PulseAudio · GitHub**. [https://gist.github.com](https://gist.github.com/lightrush/4fc5b36e01db8fae534b0ea6c16e347f)
-7. **GitHub - grisys83/LoudnessCompensator · GitHub**. [https://github.com](https://github.com/grisys83/LoudnessCompensator)
-8. **Sound mixer "loudness equalization" on a per-app basis? Solved - Windows 10 Forums**. [https://www.tenforums.com](https://www.tenforums.com/sound-audio/191227-sound-mixer-loudness-equalization-per-app-basis.html)
-9. **Free - Music on stream - A web based current song / now playing overlay | OBS Forums**. [https://obsproject.com](https://obsproject.com/forum/resources/music-on-stream-a-web-based-current-song-now-playing-overlay.1920/)
-10. **How to play sounds in github?**. [https://stackoverflow.com](https://stackoverflow.com/questions/70813487/how-to-play-sounds-in-github)

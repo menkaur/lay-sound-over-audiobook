@@ -16,6 +16,73 @@ use crate::progress;
 
 use crate::MIN_DURATION;
 
+/// Quick spot-check of music file loudness levels.
+///
+/// Measures the first 30 seconds of up to 3 randomly-selected music
+/// tracks and compares against the target. If the average loudness
+/// difference exceeds 3 LUFS, suggests using `--normalize-music`.
+pub fn spot_check_loudness(target: &LoudnessTarget, files: &[std::path::PathBuf]) {
+    if files.is_empty() {
+        return;
+    }
+
+    use rand::seq::SliceRandom;
+
+    let sample_count = files.len().min(3);
+    let mut rng = rand::thread_rng();
+    let mut indices: Vec<usize> = (0..files.len()).collect();
+    indices.shuffle(&mut rng);
+
+    let mut total_diff = 0.0f64;
+    let mut measured = 0usize;
+
+    for &idx in indices.iter().take(sample_count) {
+        let file = &files[idx];
+        let filter = format!(
+            "loudnorm=I={}:TP={}:LRA={}:print_format=json",
+            target.i, target.tp, target.lra
+        );
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-t", "30", "-i"])
+            .arg(file)
+            .args(["-af", &filter, "-f", "null", "-"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+
+        if let Ok(out) = output {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if let Some(json_end) = stderr.rfind('}') {
+                if let Some(json_start) = stderr[..=json_end].rfind('{') {
+                    let json_str = &stderr[json_start..=json_end];
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if let Some(input_i) = json["input_i"]
+                            .as_str()
+                            .and_then(|s| s.parse::<f64>().ok())
+                        {
+                            total_diff += (input_i - target.i).abs();
+                            measured += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if measured > 0 {
+        let avg_diff = total_diff / measured as f64;
+        if avg_diff > 3.0 {
+            println!(
+                "💡  Music loudness differs from target by ~{:.1} LUFS on average.",
+                avg_diff
+            );
+            println!(
+                "    Consider using --normalize-music for more consistent results.\n"
+            );
+        }
+    }
+}
+
 /// Absolute tolerance (seconds) when comparing a cached normalized file's
 /// duration to the original source duration.
 const NORM_DURATION_TOLERANCE_S: f64 = 2.0;
