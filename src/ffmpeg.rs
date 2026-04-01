@@ -118,7 +118,7 @@ fn extract_progress_time(line: &str) -> Option<f64> {
     let idx = line.find("time=")?;
     let rest = &line[idx + 5..];
     let end = rest
-        .find(|c: char| c == ' ' || c == '\r' || c == '\n')
+        .find([' ', '\r', '\n'])
         .unwrap_or(rest.len());
     let time_str = &rest[..end];
     // Skip negative times (startup) and N/A
@@ -152,7 +152,7 @@ fn run_ffmpeg_tracked(args: &[String], expected_duration: f64, pb: Option<&Progr
 
     if let Some(stderr) = child.stderr.take() {
         let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             if let Some(time) = extract_progress_time(&line) {
                 if let Some(pb) = pb {
                     update_progress(pb, time, expected_duration);
@@ -186,7 +186,7 @@ fn run_ffmpeg_tracked_capture(
 
     if let Some(stderr) = child.stderr.take() {
         let reader = BufReader::new(stderr);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             if let Some(time) = extract_progress_time(&line) {
                 if let Some(pb) = pb {
                     update_progress(pb, time, expected_duration);
@@ -202,6 +202,17 @@ fn run_ffmpeg_tracked_capture(
 }
 
 // ─── Two-Pass Loudnorm ─────────────────────────────────────────
+
+/// EBU R128 loudness target parameters.
+#[derive(Debug, Clone, Copy)]
+pub struct LoudnessTarget {
+    /// Integrated loudness in LUFS.
+    pub i: f64,
+    /// True peak limit in dBTP.
+    pub tp: f64,
+    /// Loudness range in LU.
+    pub lra: f64,
+}
 
 /// Measurements from loudnorm pass 1.
 #[derive(Debug, Clone)]
@@ -224,20 +235,24 @@ pub struct LoudnormMeasurement {
 /// progress bar in real-time based on ffmpeg's `time=` output.
 pub fn measure_loudness(
     input: &Path,
-    loudness_i: f64,
-    loudness_tp: f64,
-    loudness_lra: f64,
+    target: &LoudnessTarget,
     expected_duration: f64,
     pb: Option<&ProgressBar>,
+    ffmpeg_threads: u32,
 ) -> Option<LoudnormMeasurement> {
     let filter = format!(
         "loudnorm=I={}:TP={}:LRA={}:print_format=json",
-        loudness_i, loudness_tp, loudness_lra
+        target.i, target.tp, target.lra
     );
 
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "-hide_banner".into(),
         "-y".into(),
+    ];
+    if ffmpeg_threads > 1 {
+        args.extend(["-threads".into(), ffmpeg_threads.to_string()]);
+    }
+    args.extend([
         "-i".into(),
         input.to_string_lossy().into(),
         "-af".into(),
@@ -245,7 +260,7 @@ pub fn measure_loudness(
         "-f".into(),
         "null".into(),
         "-".into(),
-    ];
+    ]);
 
     let (_success, full_stderr) = run_ffmpeg_tracked_capture(&args, expected_duration, pb);
 
@@ -267,6 +282,14 @@ pub fn measure_loudness(
     })
 }
 
+/// Combined normalization settings — loudness target plus encoding params.
+#[derive(Debug, Clone, Copy)]
+pub struct NormConfig {
+    pub target: LoudnessTarget,
+    pub sample_rate: u32,
+    pub ffmpeg_threads: u32,
+}
+
 /// Pass 2: apply loudnorm with measured values and `linear=true`.
 ///
 /// Returns `(success, command_args)` — the command args are retained
@@ -277,10 +300,7 @@ pub fn measure_loudness(
 pub fn normalize_two_pass(
     input: &Path,
     output: &Path,
-    loudness_i: f64,
-    loudness_tp: f64,
-    loudness_lra: f64,
-    sample_rate: u32,
+    config: &NormConfig,
     measurement: &LoudnormMeasurement,
     expected_duration: f64,
     pb: Option<&ProgressBar>,
@@ -293,9 +313,9 @@ pub fn normalize_two_pass(
         "loudnorm=I={}:TP={}:LRA={}:\
          measured_I={}:measured_TP={}:measured_LRA={}:\
          measured_thresh={}:offset={}:linear=true",
-        loudness_i,
-        loudness_tp,
-        loudness_lra,
+        config.target.i,
+        config.target.tp,
+        config.target.lra,
         measurement.input_i,
         measurement.input_tp,
         measurement.input_lra,
@@ -303,19 +323,22 @@ pub fn normalize_two_pass(
         measurement.target_offset
     );
 
-    let cmd_args: Vec<String> = vec![
-        "-y".into(),
+    let mut cmd_args: Vec<String> = vec!["-y".into()];
+    if config.ffmpeg_threads > 1 {
+        cmd_args.extend(["-threads".into(), config.ffmpeg_threads.to_string()]);
+    }
+    cmd_args.extend([
         "-i".into(),
         input.to_string_lossy().into(),
         "-vn".into(),
         "-af".into(),
         filter,
         "-ar".into(),
-        sample_rate.to_string(),
+        config.sample_rate.to_string(),
         "-ac".into(),
         "2".into(),
         output.to_string_lossy().into(),
-    ];
+    ]);
 
     let success = run_ffmpeg_tracked(&cmd_args, expected_duration, pb);
     (success, cmd_args)
@@ -361,13 +384,8 @@ pub fn build_atempo_chain(speed: f64) -> String {
 
 /// All information needed to produce one output file.
 pub struct FileTask {
-    /// Original source file (for cover image extraction / logging).
-    #[allow(dead_code)]
-    pub source: PathBuf,
     /// Normalised WAV in the temp directory.
     pub normalized: PathBuf,
-    /// Relative path from input root (used for output path + display).
-    pub relative: PathBuf,
     /// Final output path.
     pub output: PathBuf,
     /// Output duration (after speed adjustment) — used for music plan & fades.
@@ -377,6 +395,22 @@ pub struct FileTask {
 }
 
 // ─── Overlay + Encode ──────────────────────────────────────────
+
+/// Configuration for the overlay + encode step.
+pub struct OverlayConfig {
+    pub volume: f64,
+    pub format: OutputFormat,
+    pub quality: u8,
+    pub sample_rate: u32,
+    pub speed: f64,
+    pub music_fade_in: f64,
+    pub music_fade_out: f64,
+    /// Number of threads for each ffmpeg subprocess.
+    /// When there are few large files, giving each ffmpeg more threads
+    /// helps utilise the full CPU.  Computed as
+    /// `max(1, pool_threads / min(pool_threads, num_files))`.
+    pub ffmpeg_threads: u32,
+}
 
 /// Build and run a single ffmpeg command that mixes the normalised
 /// voice file with the required music segments and writes the final
@@ -393,13 +427,7 @@ pub struct FileTask {
 /// on failure so the caller can log the failing command.
 pub fn overlay_music(
     task: &FileTask,
-    volume: f64,
-    format: OutputFormat,
-    quality: u8,
-    sample_rate: u32,
-    speed: f64,
-    music_fade_in: f64,
-    music_fade_out: f64,
+    config: &OverlayConfig,
     cancelled: &AtomicBool,
     pb: Option<&ProgressBar>,
 ) -> Result<(), (String, String)> {
@@ -411,8 +439,8 @@ pub fn overlay_music(
         let _ = fs::create_dir_all(p);
     }
 
-    let afmt_str = afmt(sample_rate);
-    let atempo = build_atempo_chain(speed);
+    let afmt_str = afmt(config.sample_rate);
+    let atempo = build_atempo_chain(config.speed);
 
     // Build the voice processing chain: format [+ speed]
     let voice_chain = if atempo.is_empty() {
@@ -431,10 +459,13 @@ pub fn overlay_music(
             format!("{afmt_str},{atempo}")
         };
 
-        let mut cmd_args: Vec<String> = vec!["-y".into(), "-i".into()];
-        cmd_args.push(task.normalized.to_string_lossy().into());
+        let mut cmd_args: Vec<String> = vec!["-y".into()];
+        if config.ffmpeg_threads > 1 {
+            cmd_args.extend(["-threads".into(), config.ffmpeg_threads.to_string()]);
+        }
+        cmd_args.extend(["-i".into(), task.normalized.to_string_lossy().into()]);
         cmd_args.extend(["-af".into(), voice_filter]);
-        cmd_args.extend(format.encoder_args(quality));
+        cmd_args.extend(config.format.encoder_args(config.quality));
         cmd_args.push(task.output.to_string_lossy().into());
 
         let ok = run_ffmpeg_tracked(&cmd_args, task.duration, pb);
@@ -451,6 +482,9 @@ pub fn overlay_music(
 
     // ── Build complex filter ───────────────────────────────────
     let mut cmd_args: Vec<String> = vec!["-y".into()];
+    if config.ffmpeg_threads > 1 {
+        cmd_args.extend(["-threads".into(), config.ffmpeg_threads.to_string()]);
+    }
 
     // Input 0 – normalised voice
     cmd_args.push("-i".into());
@@ -493,7 +527,7 @@ pub fn overlay_music(
                      [{l}r]atrim=0:{duration:.6},\
                      asetpts=PTS-STARTPTS,\
                      aformat=sample_fmts=fltp:channel_layouts=stereo[{l}]",
-                    sample_rate
+                    config.sample_rate
                 ));
                 labels.push(format!("[{l}]"));
                 sil_n += 1;
@@ -549,7 +583,7 @@ pub fn overlay_music(
 
     let music_chain = if n == 1 {
         // Single piece — no concat needed
-        format!("{}", labels[0])
+        labels[0].to_string()
     } else {
         // Multiple pieces — concat then continue
         format!("{}concat=n={n}:v=0:a=1[mc];[mc]", labels.join(""))
@@ -557,14 +591,14 @@ pub fn overlay_music(
 
     // ── Optional fade filters on the music bus ─────────────────
     let mut fade_filters = String::new();
-    if music_fade_in > 0.001 {
-        fade_filters.push_str(&format!("afade=t=in:d={:.6},", music_fade_in));
+    if config.music_fade_in > 0.001 {
+        fade_filters.push_str(&format!("afade=t=in:d={:.6},", config.music_fade_in));
     }
-    if music_fade_out > 0.001 {
-        let fade_start = (task.duration - music_fade_out).max(0.0);
+    if config.music_fade_out > 0.001 {
+        let fade_start = (task.duration - config.music_fade_out).max(0.0);
         fade_filters.push_str(&format!(
             "afade=t=out:st={:.6}:d={:.6},",
-            fade_start, music_fade_out
+            fade_start, config.music_fade_out
         ));
     }
 
@@ -577,11 +611,12 @@ pub fn overlay_music(
     //
     let filter = format!(
         "{parts};\
-         {music_chain}{fade_filters}volume={volume:.6}[mv];\
+         {music_chain}{fade_filters}volume={vol:.6}[mv];\
          {voice_chain};\
          [v][mv]amix=inputs=2:duration=first:normalize=0,\
          alimiter=limit=1[out]",
         parts = parts.join(";"),
+        vol = config.volume,
     );
 
     // ── Use filter_complex_script for very long filters ────────
@@ -610,7 +645,7 @@ pub fn overlay_music(
 
     // ── Output mapping and encoding ────────────────────────────
     cmd_args.extend(["-map".into(), "[out]".into()]);
-    cmd_args.extend(format.encoder_args(quality));
+    cmd_args.extend(config.format.encoder_args(config.quality));
     cmd_args.push(task.output.to_string_lossy().into());
 
     // ── Run ffmpeg with progress tracking ──────────────────────
